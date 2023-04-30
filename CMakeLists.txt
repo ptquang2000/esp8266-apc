@@ -1,1 +1,0 @@
-idf_component_register(SRCS "src/vl53l1_platform.c" "src/VL53L1X_api.c" "src/VL53L1X_calibration.c" INCLUDE_DIRS "include")

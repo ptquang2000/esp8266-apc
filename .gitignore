@@ -1,3 +1,5 @@
 msys32
 xtensa-lx106-elf
 build
+.vscode
+prj/.cache
