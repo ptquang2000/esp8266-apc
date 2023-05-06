@@ -37,7 +37,7 @@ typedef struct APC_struct
     APC_config conf;
     uint16_t dev;
 
-    uint16_t count;
+    int count;
     TaskHandle_t count_task_handle;
 } APC;
 
@@ -311,7 +311,7 @@ void APC_stop_count()
     s_apc->count_task_handle = NULL;
 }
 
-uint16_t APC_get_count()
+int APC_get_count()
 {
     return s_apc->count;
 }

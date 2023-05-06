@@ -38,6 +38,6 @@ void APC_create();
 void APC_initialize(APC_config* conf);
 void APC_start_count(uint16_t threshold);
 void APC_stop_count();
-uint16_t APC_get_count();
+int APC_get_count();
 
 #endif // APC_H

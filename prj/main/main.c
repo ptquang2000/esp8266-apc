@@ -15,7 +15,7 @@ void app_main(void)
     };
     APC_initialize(&conf);
 
-    uint16_t count = 0;
+    int count = 0;
     APC_start_count(1600);
     while (1)
     {
