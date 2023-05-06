@@ -1,26 +1,32 @@
 #include "apc.h"
 #include "VL53L1X_api.h"
-#include "include/apc.h"
+
 #include "string.h"
 #include "stdio.h"
 #include "stdlib.h"
+#include "stdint.h"
+
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "esp_log.h"
+
 #include "driver/i2c.h"
+
 #include "FreeRTOS.h"
 #include "freertos/task.h"
-#include <stdint.h>
 
 #define NO_PERSON                   0
 #define IN_FIRST_ZONE               1
 #define IN_SECOND_ZONE              2
 #define IN_OVERLAP_ZONE             3
 
+#define MAX_DISTANCE                2400 // mm
+#define MIN_DISTANCE                0   // mm
 #define DISTANCES_ARRAY_SIZE        10
 #define NOBODY                      0
 #define SOMEONE                     1
-#define LEFT                        1
-#define RIGHT                       0
+#define LEFT                        0
+#define RIGHT                       1
 
 static const char* TAG = "APC";
 
@@ -28,7 +34,6 @@ static const char* TAG = "APC";
 typedef struct APC_struct
 {
     uint8_t roi_center[2];
-    uint16_t zone;
     APC_config conf;
     uint16_t dev;
 
@@ -87,18 +92,21 @@ void APC_initialize(APC_config* apc_conf)
     set_roi_center();
 
     s_apc->dev = I2C_NUM_0;
-    s_apc->zone = 0;
+    s_apc->count_task_handle = NULL;
+    s_apc->count = 0;
+
     uint8_t state = 0;
     while (!state)
     {
         ESP_ERROR_CHECK(VL53L1X_BootState(I2C_NUM_0, &state));
-        vTaskDelay(200 / portTICK_PERIOD_MS);
+        vTaskDelay(2 / portTICK_PERIOD_MS);
     }
     ESP_LOGI(TAG, "VL53L1X is ready");
 
     uint16_t value = 0, value2 = 0;
-    uint8_t value3 = 0;
 
+    // s_apc->roi_center[0] = 175;
+    // s_apc->roi_center[1] = 231;
     ESP_LOGI(TAG, "ROI center: %d %d", s_apc->roi_center[0], s_apc->roi_center[1]);
 
     ESP_ERROR_CHECK(VL53L1X_GetSensorId(s_apc->dev, &value));
@@ -124,23 +132,13 @@ void APC_initialize(APC_config* apc_conf)
     ESP_ERROR_CHECK(VL53L1X_SetROI(s_apc->dev, s_apc->conf.roi_x, s_apc->conf.roi_y));
     ESP_ERROR_CHECK(VL53L1X_GetROI_XY(s_apc->dev, &value, &value2));
     ESP_ERROR_CHECK(value != s_apc->conf.roi_x || value2 != s_apc->conf.roi_y);
-    value = 0;
-    value2 = 0;
-
-    ESP_ERROR_CHECK(VL53L1X_SetROICenter(s_apc->dev, s_apc->roi_center[s_apc->zone]));
-    ESP_ERROR_CHECK(VL53L1X_GetROICenter(s_apc->dev, &value3));
-    ESP_ERROR_CHECK(value3 != s_apc->roi_center[s_apc->zone]);
-    value3 = 0;
-    
-    s_apc->count_task_handle = NULL;
-    s_apc->count = 0;
 }
 
 static void count_task(void* p)
 {
     ESP_ERROR_CHECK(VL53L1X_StartRanging(s_apc->dev));
-    uint8_t isDataReady = 0, rangeStatus;
-    uint16_t threshold = (int*)p;
+    uint8_t is_data_ready = 0, range_status;
+    uint16_t threshold = (uint16_t)p;
 
     uint8_t path_track[] = {0, 0, 0, 0};
     uint8_t path_track_filling_size = 1;
@@ -149,63 +147,91 @@ static void count_task(void* p)
     uint16_t distances[2][DISTANCES_ARRAY_SIZE];
     uint8_t distances_table_size[] = {0,0};
 
+    uint8_t zone = RIGHT;
+    uint8_t event_counts = 0;
     uint16_t distance;
     uint16_t min_distance;
     uint8_t i;
 
     uint8_t current_zone_state = NOBODY;
-    uint8_t all_zone_current_state = 0;
+    uint8_t all_zones_current_state = 0;
     uint8_t an_event_occurred = 0;
 
     while (1)
     {
-        s_apc->zone++;
-        s_apc->zone = s_apc->zone % 2;
-        current_zone_state = NOBODY;
-        all_zone_current_state = 0;
-        an_event_occurred = 0;
-
-        while (!isDataReady)
+        while (!is_data_ready)
         {
-            ESP_ERROR_CHECK(VL53L1X_CheckForDataReady(s_apc->dev, &isDataReady));
-            vTaskDelay(s_apc->conf.timing_budget / portTICK_PERIOD_MS);
+            ESP_ERROR_CHECK(VL53L1X_CheckForDataReady(s_apc->dev, &is_data_ready));
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
         }
-        isDataReady = 0;
-        ESP_ERROR_CHECK(VL53L1X_GetRangeStatus(s_apc->dev, &rangeStatus));
+        is_data_ready = 0;
+        ESP_ERROR_CHECK(VL53L1X_GetRangeStatus(s_apc->dev, &range_status));
         ESP_ERROR_CHECK(VL53L1X_GetDistance(s_apc->dev, &distance));
         ESP_ERROR_CHECK(VL53L1X_ClearInterrupt(s_apc->dev));
+        ESP_ERROR_CHECK(VL53L1X_SetROICenter(s_apc->dev, s_apc->roi_center[zone]));
 
-        ESP_ERROR_CHECK(VL53L1X_SetROICenter(s_apc->dev, s_apc->roi_center[s_apc->zone]));
+        if ((range_status == 0) || (range_status == 4) || (range_status == 7)) 
+        {
+            distance = distance <= MIN_DISTANCE ? MAX_DISTANCE + MIN_DISTANCE : distance;
+        }
+        else
+        {
+            distance = MAX_DISTANCE;
+        }
 
-        if (distances_table_size[s_apc->zone] < DISTANCES_ARRAY_SIZE) {
-            distances[s_apc->zone][distances_table_size[s_apc->zone]] = distance;
-            distances_table_size[s_apc->zone]++;
+        current_zone_state = NOBODY;
+        all_zones_current_state = 0;
+        an_event_occurred = 0;
+
+        if (distances_table_size[zone] < DISTANCES_ARRAY_SIZE) {
+            distances[zone][distances_table_size[zone]] = distance;
+            distances_table_size[zone]++;
         }
         else {
-            for (i=1; i<DISTANCES_ARRAY_SIZE; i++)
-                distances[s_apc->zone][i-1] = distances[s_apc->zone][i];
-            distances[s_apc->zone][DISTANCES_ARRAY_SIZE-1] = distance;
+            for (i = 1; i < DISTANCES_ARRAY_SIZE; i++)
+                distances[zone][i-1] = distances[zone][i];
+            distances[zone][DISTANCES_ARRAY_SIZE-1] = distance;
         }
 
-        min_distance = distances[s_apc->zone][0];
-        if (distances_table_size[s_apc->zone] >= 2) {
-            for (i=1; i<distances_table_size[s_apc->zone]; i++) {
-                if (distances[s_apc->zone][i] < min_distance)
-                    min_distance = distances[s_apc->zone][i];
+        min_distance = MAX_DISTANCE;
+        uint16_t sum = 1;
+        if (distances_table_size[zone] >= 2) {
+            for (i = 0; i < distances_table_size[zone]; i++) {
+                if (distances[zone][i] < min_distance)
+                {
+                    min_distance = distances[zone][i];
+                }
+                
+                // if (distances[zone][i] < threshold)
+                // {
+                //     min_distance += distances[zone][i];
+                //     sum++;
+                // }
+                // if (i == distances_table_size[zone] - 1)
+                // {
+                //     min_distance = min_distance / sum;
+                // }
             }
         }
 
         if (min_distance < threshold) {
             current_zone_state = SOMEONE;
         }
-        if (s_apc->zone == LEFT) {
+
+        if (distance < threshold)
+        {
+            event_counts++;
+        }
+
+        if (zone == LEFT) {
             if (current_zone_state != left_prev_state) {
                 an_event_occurred = 1;
                 if (current_zone_state == SOMEONE) {
-                    all_zone_current_state += 1;
+                    all_zones_current_state += IN_FIRST_ZONE;
                 }
                 if (right_prev_state == SOMEONE) {
-                    all_zone_current_state += 2;
+                    all_zones_current_state += IN_SECOND_ZONE;
                 }
                 left_prev_state = current_zone_state;
             }
@@ -214,10 +240,10 @@ static void count_task(void* p)
             if (current_zone_state != right_prev_state) {
                 an_event_occurred = 1;
                 if (current_zone_state == SOMEONE) {
-                    all_zone_current_state += 2;
+                    all_zones_current_state += IN_SECOND_ZONE;
                 }
                 if (left_prev_state == SOMEONE) {
-                    all_zone_current_state += 1;
+                    all_zones_current_state += IN_FIRST_ZONE;
                 }
                 right_prev_state = current_zone_state;
             }
@@ -225,38 +251,58 @@ static void count_task(void* p)
 
         if (an_event_occurred) {
             if (path_track_filling_size < 4) {
-                path_track_filling_size ++;
+                path_track_filling_size++;
             }
 
             if ((left_prev_state == NOBODY) && (right_prev_state == NOBODY)) {
                 if (path_track_filling_size == 4) {
                     ESP_LOGI(TAG, "Path track: %d %d %d %d", path_track[0], path_track[1], path_track[2], path_track[3]);
-                    if ((path_track[1] == 1)  && (path_track[2] == 3) && (path_track[3] == 2)) {
-                        s_apc->count++;
-                        distances_table_size[0] = 0;
-                        distances_table_size[1] = 0;
-                    } else if ((path_track[1] == 2)  && (path_track[2] == 3) && (path_track[3] == 1)) {
-                        s_apc->count--;
-                        distances_table_size[0] = 0;
-                        distances_table_size[1] = 0;
-                    } else {
-                        distances_table_size[0] = 0;
-                        distances_table_size[1] = 0;
-                    }
+                    if (event_counts >= DISTANCES_ARRAY_SIZE * .5)
+                    {
+                        if (
+                                (path_track[1] == IN_FIRST_ZONE) && 
+                                (path_track[2] == IN_OVERLAP_ZONE) &&
+                                (path_track[3] == IN_SECOND_ZONE)) {
+                            s_apc->count++;
+                        } else if (
+                                (path_track[1] == IN_SECOND_ZONE) &&
+                                (path_track[2] == IN_OVERLAP_ZONE) && 
+                                (path_track[3] == IN_FIRST_ZONE)) {
+                            s_apc->count--;
+                        }
+                    } 
+                    distances_table_size[0] = 0;
+                    distances_table_size[1] = 0;
                 }
+                event_counts = 0;
                 path_track_filling_size = 1;
             }
             else {
-                path_track[path_track_filling_size-1] = all_zone_current_state;
+                // printf("Zone %d:", zone);
+                // for (i = 0; i < DISTANCES_ARRAY_SIZE; i++)
+                // {
+                //     printf("\t%d", distances[zone][i]); 
+                //     if (i == DISTANCES_ARRAY_SIZE - 1) printf("\n");
+                // }
+
+                printf("Event:\t%d, Path size:\t%d, Zone %d:", event_counts, path_track_filling_size - 1, zone);
+                printf("\t%d", distances[LEFT][distances_table_size[LEFT] - 1]); 
+                printf("\t%d\n", distances[RIGHT][distances_table_size[RIGHT] - 1]); 
+
+                // printf("Event:\t%d, Path size:\t%d, Zone %d:\t%d\n", event_counts, path_track_filling_size - 1, zone, min_distance);
+
+                path_track[path_track_filling_size - 1] = all_zones_current_state;
             }
         }
+        zone++;
+        zone = zone % 2;
     }
 }
 
 void APC_start_count(uint16_t threshold)
 {
     ESP_ERROR_CHECK(s_apc->count_task_handle != NULL);
-    xTaskCreate(count_task, "apc_count", 1024, threshold, tskIDLE_PRIORITY, &s_apc->count_task_handle); 
+    xTaskCreate(count_task, "apc_count", 1024, (void*) threshold, tskIDLE_PRIORITY + 1, &s_apc->count_task_handle); 
 }
 
 void APC_stop_count()
