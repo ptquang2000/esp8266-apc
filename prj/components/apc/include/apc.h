@@ -36,6 +36,8 @@ typedef struct APC_config_struct
 
 void APC_create();
 void APC_initialize(APC_config* conf);
+void APC_initialize_4x4();
+void APC_start_4x4(uint16_t threshold);
 void APC_start_count(uint16_t threshold);
 void APC_stop_count();
 int APC_get_count();

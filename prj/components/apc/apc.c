@@ -30,6 +30,24 @@
 
 static const char* TAG = "APC";
 
+/*
+    XSHUT ...  VCC
+    PS    ...  VCC
+*/
+static const uint8_t s_roi_centers[] = {
+    42,     74,     106,    14, 
+    46,     78,     110,    245,
+    213,    181,    149,    241,
+    209,    177,    145,    10, 
+}; 
+
+static const APC_config s_config_4x4 = {
+    .roi_x = 4,
+    .roi_y = 4,
+    .distance_mode = LongDistanceMode,
+    .timing_budget = Ms20,
+};
+
 
 typedef struct APC_struct
 {
@@ -72,6 +90,139 @@ void APC_create()
 void APC_destroy()
 {
     free(s_apc);
+}
+
+void APC_initialize_4x4()
+{
+    int i2c_master_port = I2C_NUM_0;
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = CFG_I2C_MASTER_SDA_IO;
+    conf.sda_pullup_en = 1;
+    conf.scl_io_num = CFG_I2C_MASTER_SCL_IO;
+    conf.scl_pullup_en = 1;
+    ESP_ERROR_CHECK(i2c_driver_install(i2c_master_port, conf.mode));
+    ESP_ERROR_CHECK(i2c_param_config(i2c_master_port, &conf));
+
+    s_apc->dev = I2C_NUM_0;
+    s_apc->count_task_handle = NULL;
+    s_apc->count = 0;
+    memcpy(&s_apc->conf, &s_config_4x4, sizeof(APC_config));
+
+    uint8_t state = 0;
+    while (!state)
+    {
+        ESP_ERROR_CHECK(VL53L1X_BootState(I2C_NUM_0, &state));
+        vTaskDelay(2 / portTICK_PERIOD_MS);
+    }
+    ESP_LOGI(TAG, "VL53L1X is ready");
+
+    uint16_t value = 0, value2 = 0;
+
+    ESP_ERROR_CHECK(VL53L1X_GetSensorId(s_apc->dev, &value));
+    ESP_LOGI(TAG, "VL53L1X ID: 0x%04x", value);
+
+    ESP_ERROR_CHECK(VL53L1X_SensorInit(s_apc->dev));
+
+    ESP_ERROR_CHECK(VL53L1X_SetDistanceMode(s_apc->dev, s_apc->conf.distance_mode));
+    ESP_ERROR_CHECK(VL53L1X_GetDistanceMode(s_apc->dev, &value));
+    ESP_ERROR_CHECK(value != s_apc->conf.distance_mode);
+    value = 0;
+
+    ESP_ERROR_CHECK(VL53L1X_SetTimingBudgetInMs(s_apc->dev, s_apc->conf.timing_budget));
+    ESP_ERROR_CHECK(VL53L1X_GetTimingBudgetInMs(s_apc->dev, &value));
+    ESP_ERROR_CHECK(value != s_apc->conf.timing_budget);
+    value = 0;
+
+    ESP_ERROR_CHECK(VL53L1X_SetInterMeasurementInMs(s_apc->dev, s_apc->conf.timing_budget));
+    ESP_ERROR_CHECK(VL53L1X_GetInterMeasurementInMs(s_apc->dev, &value));
+    ESP_ERROR_CHECK(value != s_apc->conf.timing_budget);
+    value = 0;
+
+    ESP_ERROR_CHECK(VL53L1X_SetROI(s_apc->dev, s_apc->conf.roi_x, s_apc->conf.roi_y));
+    ESP_ERROR_CHECK(VL53L1X_GetROI_XY(s_apc->dev, &value, &value2));
+    ESP_ERROR_CHECK(value != s_apc->conf.roi_x || value2 != s_apc->conf.roi_y);
+}
+
+static void count_4x4_task(void* p)
+{
+    uint16_t threshold = (uint16_t)p;
+    uint8_t range_status, i, j,
+        is_data_ready = 0, 
+        roi_index = 0;
+    uint16_t distances[16] = {0};
+    uint16_t debug_distances[16] = {0x0};
+    uint8_t full_roi = 0;
+    uint16_t min_distance = 0;
+    uint16_t row1, row2, row3, row4;
+    ESP_ERROR_CHECK(VL53L1X_StartRanging(s_apc->dev));
+    while (1)
+    {
+        while (!is_data_ready)
+        {
+            ESP_ERROR_CHECK(VL53L1X_CheckForDataReady(s_apc->dev, &is_data_ready));
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            esp_task_wdt_reset();
+        }
+        is_data_ready = 0;
+        ESP_ERROR_CHECK(VL53L1X_GetRangeStatus(s_apc->dev, &range_status));
+        ESP_ERROR_CHECK(VL53L1X_GetDistance(s_apc->dev, &distances[roi_index]));
+        ESP_ERROR_CHECK(VL53L1X_ClearInterrupt(s_apc->dev));
+        ESP_ERROR_CHECK(VL53L1X_SetROICenter(s_apc->dev, s_roi_centers[roi_index]));
+
+        min_distance = distances[0];
+        for (i = 0; i < 16; i++)
+        {
+            min_distance = min_distance < distances[i] ? min_distance : distances[i];
+            debug_distances[i] = distances[i] < threshold;
+        }
+
+        if (roi_index == 15)
+        {
+            for (i = 0; i <  16; i++)
+            {
+                if (i % 4 == 0) printf("\n%d\t", debug_distances[i]);
+                else printf("%d\t", debug_distances[i]);
+                if (i == 15) printf("\n");
+            }
+        }
+
+        if (roi_index == 15)
+        {
+            uint8_t two_person = debug_distances[1] | debug_distances[5] | debug_distances[9] | debug_distances[13];
+            two_person |= debug_distances[2] | debug_distances[6] | debug_distances[10] | debug_distances[14];
+            two_person = !two_person && (debug_distances[3] | debug_distances[7] | debug_distances[11] | debug_distances[15]);
+            two_person &= debug_distances[0] | debug_distances[4] | debug_distances[8] | debug_distances[12];
+            
+            uint8_t someone = debug_distances[0] | debug_distances[4] | debug_distances[8] | debug_distances[12];
+            someone |=  debug_distances[1] | debug_distances[5] | debug_distances[9] | debug_distances[13];
+            someone |= debug_distances[2] | debug_distances[6] | debug_distances[10] | debug_distances[14];
+            someone |= debug_distances[3] | debug_distances[7] | debug_distances[11] | debug_distances[15];
+
+            if (two_person)
+            {
+                printf("There are two person\n");
+            }
+            else if (someone)
+            {
+                printf("There is one person%d\n", someone);
+            }
+
+            row1 = (distances[0] + distances[1] + distances[2] + distances[3]) / 4;
+            row2 = (distances[4] + distances[5] + distances[6] + distances[7]) / 4;
+            row3 = (distances[8] + distances[9] + distances[10] + distances[11]) / 4;
+            row4 = (distances[12] + distances[13] + distances[14] + distances[15]) / 4;
+        }
+
+        roi_index++;
+        roi_index = roi_index % 16;
+    }
+}
+
+void APC_start_4x4(uint16_t threshold)
+{
+    ESP_ERROR_CHECK(s_apc->count_task_handle != NULL);
+    xTaskCreate(count_4x4_task, "apc_count", 1024, (void*) threshold, tskIDLE_PRIORITY + 1, &s_apc->count_task_handle); 
 }
 
 void APC_initialize(APC_config* apc_conf)
